@@ -429,9 +429,10 @@ class App(tk.Tk):
         conf = {
             "extractor": {
                 "skip": True,
-                "retries": 5,
+                "retries": 3,
                 "retry-codes": [429, 500, 502, 503],
-                "sleep-request": 0.5,
+                "sleep-request": 0.1,
+                "workers": 8,
                 "directory": [],
             }
         }
