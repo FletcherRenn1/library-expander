@@ -96,7 +96,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Library Expander")
-        self.geometry("600x750")
+        self.geometry("600x820")
         self.resizable(False, False)
         self.configure(bg=BG)
 
