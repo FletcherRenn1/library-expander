@@ -31,8 +31,7 @@ WARNING   = "#facc15"
 ERR       = "#f87171"
 ACTIVE_BG = "#2a2040"
 
-BROWSERS  = ["Chrome", "Firefox", "Edge", "Brave", "None (no cookies)"]
-IMG_EXTS  = (".jpg", ".jpeg", ".png", ".webp")
+BROWSERS = ["Chrome", "Firefox", "Edge", "Brave", "None (no cookies)"]
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -48,6 +47,20 @@ STATUS_COLORS = {
     "Failed":      ERR,
     "Cancelled":   FG_MUTED,
 }
+
+
+def _is_image(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            h = f.read(12)
+        return (
+            h[:3] == b"\xff\xd8\xff" or          # JPEG
+            h[:8] == b"\x89PNG\r\n\x1a\n" or     # PNG
+            h[:4] == b"RIFF" and h[8:12] == b"WEBP" or  # WebP
+            h[:6] in (b"GIF87a", b"GIF89a")      # GIF
+        )
+    except Exception:
+        return False
 
 
 def parse_chapter(name: str):
@@ -433,7 +446,6 @@ class App(tk.Tk):
                 "retry-codes": [429, 500, 502, 503],
                 "sleep-request": 0.1,
                 "workers": 8,
-                "directory": [],
             }
         }
         fd, conf_path = tempfile.mkstemp(suffix=".json", prefix="gdl_")
@@ -456,7 +468,6 @@ class App(tk.Tk):
             cmd = base_cmd + [
                 "--config", conf_path,
                 "--dest", raw_dir,
-                "--filename", "{chapter}/{filename}",
             ]
             if job["browser"] != "None (no cookies)":
                 cmd += ["--cookies-from-browser", job["browser"].lower()]
@@ -517,10 +528,14 @@ class App(tk.Tk):
             self._emit("⚠ raw/ not found — nothing to convert", "warn")
             return 0
 
-        chapters = sorted(
-            d for d in os.listdir(raw_dir)
-            if os.path.isdir(os.path.join(raw_dir, d))
-        )
+        chapter_map = {}
+        for root, dirs, files in os.walk(raw_dir):
+            imgs = sorted(f for f in files if _is_image(os.path.join(root, f)))
+            if imgs:
+                rel = os.path.relpath(root, raw_dir)
+                chapter_map[rel] = (root, imgs)
+
+        chapters = sorted(chapter_map)
         if not chapters:
             self._emit("⚠ No chapter folders found in raw/", "warn")
             return 0
@@ -529,16 +544,9 @@ class App(tk.Tk):
         for ch in chapters:
             if self._stop_req:
                 break
-            ch_path = os.path.join(raw_dir, ch)
-            imgs    = sorted(
-                f for f in os.listdir(ch_path)
-                if f.lower().endswith(IMG_EXTS)
-            )
-            if not imgs:
-                self._emit(f"⚠ Skipped: {ch} — no images found", "warn")
-                continue
-
-            pdf_name = chapter_pdf_name(ch)
+            ch_path, imgs = chapter_map[ch]
+            ch_label = os.path.basename(ch)
+            pdf_name = chapter_pdf_name(ch_label)
             pdf_path = os.path.join(out_dir, pdf_name)
 
             if job["resume"] and os.path.exists(pdf_path):
@@ -549,14 +557,15 @@ class App(tk.Tk):
                 pages = []
                 for img_file in imgs:
                     img_path = os.path.join(ch_path, img_file)
-                    if img_file.lower().endswith(".webp"):
-                        with PILImg.open(img_path) as im:
+                    with open(img_path, "rb") as f:
+                        data = f.read()
+                    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                        with PILImg.open(io.BytesIO(data)) as im:
                             buf = io.BytesIO()
                             im.convert("RGB").save(buf, format="JPEG", quality=95)
                             pages.append(buf.getvalue())
                     else:
-                        with open(img_path, "rb") as f:
-                            pages.append(f.read())
+                        pages.append(data)
 
                 with open(pdf_path, "wb") as f:
                     f.write(img2pdf.convert(pages))
@@ -564,7 +573,7 @@ class App(tk.Tk):
                 self._emit(f"✓ {pdf_name}", "ok")
                 count += 1
             except Exception as exc:
-                self._emit(f"✗ Failed to convert {ch}: {exc}", "err")
+                self._emit(f"✗ Failed to convert {ch_label}: {exc}", "err")
 
         return count
 
