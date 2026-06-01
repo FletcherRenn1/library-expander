@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -31,7 +32,8 @@ WARNING   = "#facc15"
 ERR       = "#f87171"
 ACTIVE_BG = "#2a2040"
 
-BROWSERS = ["Chrome", "Firefox", "Edge", "Brave", "None (no cookies)"]
+BROWSERS          = ["Chrome", "Firefox", "Edge", "Brave", "None (no cookies)"]
+WATCHDOG_TIMEOUT  = 60
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -110,7 +112,7 @@ class App(tk.Tk):
         self.after(50, self._poll_ui)
 
     def _load_settings(self):
-        self._cfg = {"output_dir": "", "browser": "Chrome"}
+        self._cfg = {"output_dir": "", "browser": "Chrome", "workers": 8}
         try:
             with open(SETTINGS) as f:
                 self._cfg.update(json.load(f))
@@ -197,6 +199,22 @@ class App(tk.Tk):
                      state="readonly", font=("Segoe UI", 10), style="D.TCombobox",
                      width=28).pack(anchor="w", pady=(2, 0))
 
+        tk.Label(inner, text="Download workers", font=("Segoe UI", 10),
+                 bg=SURFACE, fg=FG).pack(anchor="w", pady=(6, 0))
+        workers_row = tk.Frame(inner, bg=SURFACE)
+        workers_row.pack(fill="x", pady=(2, 0))
+        self._workers_var = tk.IntVar(value=self._cfg.get("workers", 8))
+        tk.Spinbox(
+            workers_row, from_=2, to=10, textvariable=self._workers_var,
+            font=("Segoe UI", 10), bg=INPUT_BG, fg=FG, insertbackground=FG,
+            buttonbackground=INPUT_BG, relief="flat", bd=0, width=5,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+            command=self._on_workers_change,
+        ).pack(side="left", ipady=4)
+        self._workers_warn = tk.Label(workers_row, text="", font=("Segoe UI", 9),
+                                      bg=SURFACE, fg=WARNING)
+        self._workers_warn.pack(side="left", padx=(10, 0))
+
         btn_row = tk.Frame(outer, bg=BG)
         btn_row.pack(fill="x", pady=(0, 8))
 
@@ -272,6 +290,14 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _on_workers_change(self):
+        v = self._workers_var.get()
+        if v > 6:
+            self._workers_warn.configure(
+                text="⚠ High worker count may cause rate limits or IP bans")
+        else:
+            self._workers_warn.configure(text="")
+
     def _browse(self):
         d = filedialog.askdirectory(initialdir=self._outdir_var.get() or os.path.expanduser("~"))
         if d:
@@ -302,12 +328,13 @@ class App(tk.Tk):
             messagebox.showwarning("Missing input", "Output directory is required.")
             return
         browser = self._browser_var.get()
-        self._cfg.update({"browser": browser, "output_dir": outdir})
+        workers = self._workers_var.get()
+        self._cfg.update({"browser": browser, "output_dir": outdir, "workers": workers})
         self._save_settings()
         self.jobs.append({
             "url": url, "folder": folder, "outdir": outdir,
             "browser": browser, "resume": self._resume_var.get(),
-            "status": "Waiting",
+            "workers": workers, "status": "Waiting",
         })
         self._url_var.set("")
         self._folder_var.set("")
@@ -445,7 +472,7 @@ class App(tk.Tk):
                 "retries": 3,
                 "retry-codes": [429, 500, 502, 503],
                 "sleep-request": 0.1,
-                "workers": 8,
+                "workers": job.get("workers", 8),
             }
         }
         fd, conf_path = tempfile.mkstemp(suffix=".json", prefix="gdl_")
@@ -465,52 +492,91 @@ class App(tk.Tk):
                 )
                 return False
 
-            cmd = base_cmd + [
-                "--config", conf_path,
-                "--dest", raw_dir,
-            ]
+            cmd = base_cmd + ["--config", conf_path, "--dest", raw_dir]
             if job["browser"] != "None (no cookies)":
                 cmd += ["--cookies-from-browser", job["browser"].lower()]
             cmd.append(job["url"])
 
-            self._emit(f"▶ Downloading: {job['url']}", "norm")
-
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            proc  = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", creationflags=flags,
-            )
-            self._cur_proc = proc
 
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip()
-                if not line:
-                    continue
+            for attempt in range(1, 4):
                 if self._stop_req:
-                    proc.terminate()
-                    break
-                ll = line.lower()
-                if "cookie" in ll and any(w in ll for w in ("error", "fail", "unable", "cannot")):
-                    self._emit(
-                        f'⚠ Could not read cookies from {job["browser"]}. '
-                        'Try a different browser or "None (no cookies)".', "warn"
-                    )
-                else:
-                    self._emit(line, "norm")
+                    return False
 
-            proc.wait()
-            self._cur_proc = None
-            if self._stop_req:
-                return False
-            if proc.returncode != 0:
-                self._emit(f"✗ gallery-dl exited with code {proc.returncode}", "err")
-                return False
-            return True
+                if attempt == 1:
+                    self._emit(f"▶ Downloading: {job['url']}", "norm")
+                else:
+                    self._emit(f"↻ Stall detected — restarting (attempt {attempt}/3)...", "warn")
+
+                stalled        = [False]
+                last_activity  = [time.time()]
+                last_file      = [None]
+
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", creationflags=flags,
+                )
+                self._cur_proc = proc
+
+                def _watchdog(p=proc, s=stalled, la=last_activity, lf=last_file):
+                    while p.poll() is None:
+                        time.sleep(5)
+                        if time.time() - la[0] > WATCHDOG_TIMEOUT:
+                            s[0] = True
+                            p.terminate()
+                            return
+
+                threading.Thread(target=_watchdog, daemon=True).start()
+
+                for raw_line in proc.stdout:
+                    last_activity[0] = time.time()
+                    line = raw_line.rstrip()
+                    if not line:
+                        continue
+                    if self._stop_req:
+                        proc.terminate()
+                        break
+                    ll = line.lower()
+                    if "cookie" in ll and any(w in ll for w in ("error", "fail", "unable", "cannot")):
+                        self._emit(
+                            f'⚠ Could not read cookies from {job["browser"]}. '
+                            'Try a different browser or "None (no cookies)".', "warn"
+                        )
+                    else:
+                        self._emit(line, "norm")
+                        if os.sep in line or "/" in line:
+                            last_file[0] = line.strip().lstrip("#").strip()
+
+                proc.wait()
+                self._cur_proc = None
+
+                if self._stop_req:
+                    return False
+
+                if stalled[0]:
+                    target = last_file[0]
+                    if target and os.path.isfile(target):
+                        try:
+                            os.unlink(target)
+                            self._emit(f"⚠ Deleted partial file: {os.path.basename(target)}", "warn")
+                        except Exception:
+                            pass
+                    continue
+
+                if proc.returncode != 0:
+                    self._emit(f"✗ gallery-dl exited with code {proc.returncode}", "err")
+                    return False
+
+                return True
+
+            self._emit("✗ Download failed after 3 stall retries.", "err")
+            return False
         finally:
             try:
                 os.unlink(conf_path)
             except Exception:
                 pass
+
 
     def _step_convert(self, job) -> int:
         try:
